@@ -5,7 +5,7 @@
 #  Default router IP: 192.168.1.1
 # =============================================================
 
-ROUTER_IP="${1:-192.168.1.1}"
+ROUTER_IP="${1:-192.168.2.1}"
 TEST_HOST="8.8.8.8"
 TEST_HOST2="1.1.1.1"
 TEST_HOST_IPV6="2001:4860:4860::8888"  # Google IPv6 DNS
@@ -38,6 +38,144 @@ info()     { echo -e "  ${CYAN}→${RESET}  $1"; echo "  [INFO] $1" >> "$REPORT_
 skip()     { echo -e "  ${YELLOW}–${RESET}  $1 (tool not available, skipping)"; echo "  [SKIP] $1 (tool not available, skipping)" >> "$REPORT_FILE"; }
 
 cmd_exists() { command -v "$1" &>/dev/null; }
+
+# ── Dependency Check / Auto Install ───────────────────────────
+install_package() {
+    local pkg="$1"
+
+    info "Installing missing package: $pkg"
+
+    # Debian / Ubuntu
+    if cmd_exists apt-get; then
+        sudo apt-get update -y >/dev/null 2>&1
+        sudo apt-get install -y "$pkg"
+
+    # RHEL / CentOS / AlmaLinux
+    elif cmd_exists dnf; then
+        sudo dnf install -y "$pkg"
+
+    elif cmd_exists yum; then
+        sudo yum install -y "$pkg"
+
+    # Arch Linux
+    elif cmd_exists pacman; then
+        sudo pacman -Sy --noconfirm "$pkg"
+
+    # macOS
+    elif cmd_exists brew; then
+        brew install "$pkg"
+
+    else
+        fail "Unsupported package manager. Please install $pkg manually."
+        return 1
+    fi
+}
+
+check_tool() {
+    local binary="$1"
+    local package="$2"
+
+    if ! cmd_exists "$binary"; then
+        warn "$binary not found"
+        install_package "$package"
+
+        if cmd_exists "$binary"; then
+            ok "$binary installed successfully"
+        else
+            fail "Failed to install $binary"
+        fi
+    else
+        ok "$binary already installed"
+    fi
+}
+
+check_dependencies() {
+    section "DEPENDENCY CHECK"
+    log ""
+
+    # ── DNS Tools ─────────────────────────────────────────────
+    if cmd_exists apt-get; then
+        DNS_PKG="dnsutils"
+    elif cmd_exists dnf || cmd_exists yum; then
+        DNS_PKG="bind-utils"
+    elif cmd_exists pacman; then
+        DNS_PKG="bind"
+    elif cmd_exists brew; then
+        DNS_PKG="bind"
+    fi
+
+    check_tool "dig" "$DNS_PKG"
+
+    # ── MTR ───────────────────────────────────────────────────
+    if cmd_exists apt-get; then
+        MTR_PKG="mtr-tiny"
+    else
+        MTR_PKG="mtr"
+    fi
+
+    check_tool "mtr" "$MTR_PKG"
+
+    # ── Speedtest ─────────────────────────────────────────────
+    if ! cmd_exists speedtest-cli && ! cmd_exists speedtest; then
+        warn "speedtest-cli not found"
+
+        if cmd_exists pip3; then
+            info "Installing speedtest-cli using pip3..."
+            sudo pip3 install speedtest-cli
+        else
+            install_package speedtest-cli
+        fi
+
+        if cmd_exists speedtest-cli || cmd_exists speedtest; then
+            ok "speedtest-cli installed successfully"
+        else
+            fail "Failed to install speedtest-cli"
+        fi
+    else
+        ok "speedtest-cli already installed"
+    fi
+
+    # ── Traceroute ────────────────────────────────────────────
+    check_tool "traceroute" "traceroute"
+
+    # ── curl ──────────────────────────────────────────────────
+    check_tool "curl" "curl"
+
+    # ── Netcat ────────────────────────────────────────────────
+    if cmd_exists apt-get; then
+        NC_PKG="netcat-openbsd"
+    else
+        NC_PKG="nc"
+    fi
+
+    check_tool "nc" "$NC_PKG"
+
+    # ── Ping Utilities ────────────────────────────────────────
+    if ! cmd_exists ping; then
+        warn "ping utility not found"
+
+        if cmd_exists apt-get; then
+            install_package iputils-ping
+        elif cmd_exists dnf || cmd_exists yum; then
+            install_package iputils
+        elif cmd_exists pacman; then
+            install_package iputils
+        fi
+
+        if cmd_exists ping; then
+            ok "ping installed successfully"
+        else
+            fail "Failed to install ping"
+        fi
+    else
+        ok "ping already installed"
+    fi
+
+    log ""
+}
+
+# Run dependency check before tests
+check_dependencies
 
 # ── System Info ────────────────────────────────────────────────
 OS_NAME=$(uname -s)
@@ -178,6 +316,47 @@ elif cmd_exists tracepath; then
 fi
 
 # ══════════════════════════════════════════════════════════════
+#  TEST 3b — MTR (Per-hop packet loss & jitter analysis)
+# ══════════════════════════════════════════════════════════════
+section "TEST 3b — MTR (Per-Hop Loss & Jitter)"
+log ""
+
+if cmd_exists mtr; then
+    log "  HOW TO READ THIS REPORT:"
+    log "  - Loss% column: packet loss observed at each hop"
+    log "  - Hop 1 is usually your router/local gateway"
+    log "  - Loss beginning at hop 1 may indicate local LAN/router issues"
+    log "  - Loss beginning after hop 1 usually indicates ISP/upstream issues"
+    log "  - Real packet loss must persist through later hops and appear at the destination"
+    log "  - Some routers intentionally deprioritize ICMP and may show false loss"
+    log "  - StDev column: jitter/latency variation (higher = less stable)"
+    log "  - AS column: network owner of the hop (ISP/transit/provider)"
+    log ""
+
+    info "Running MTR to $TEST_HOST (200 cycles — takes ~2 min)..."
+    log ""
+    log "  ── MTR Report: $TEST_HOST (Google DNS) ──────────────────────"
+    mtr -rwzc 200 --no-dns "$TEST_HOST" 2>&1 | sed 's/^/  /' | tee -a "$REPORT_FILE"
+    log ""
+
+    info "Running MTR to $TEST_HOST2 (200 cycles — takes ~2 min)..."
+    log ""
+    log "  ── MTR Report: $TEST_HOST2 (Cloudflare) ─────────────────────"
+    mtr -rwzc 200 --no-dns "$TEST_HOST2" 2>&1 | sed 's/^/  /' | tee -a "$REPORT_FILE"
+    log ""
+
+    log "  [NOTE] --no-dns skips reverse DNS lookups which can skew"
+    log "         loss% readings on hops with unresponsive PTR records."
+    log ""
+    warn "Review the Loss% column above — show this to your ISP tech."
+    info "Any hop with Loss% >= 5% that persists to destination = ISP-side packet loss."
+else
+    skip "mtr not installed — install with: sudo apt install mtr-tiny"
+    log "  mtr gives the strongest per-hop loss evidence for ISP disputes."
+    log "  Run: sudo apt install mtr-tiny  then re-run this script."
+fi
+
+# ══════════════════════════════════════════════════════════════
 #  TEST 4 — DNS RESOLUTION SPEED
 # ══════════════════════════════════════════════════════════════
 section "TEST 4 — DNS RESOLUTION SPEED"
@@ -188,19 +367,19 @@ resolve_dns() {
     local server="$2"
     local domain="google.com"
 
-    # Skip if no server IP was found (e.g. empty ISP DNS)
+    # Skip if no server IP was found
     if [ -z "$server" ]; then
         skip "DNS via $label — could not detect server IP"
         return
     fi
 
     local resolved=false
+    local dig_error=""
 
-    # ── Try dig ───────────────────────────────────────────────
+    # ── Try dig (3 tries to survive packet loss) ──────────────
     if cmd_exists dig; then
         local result ms
-        # -4 forces IPv4 transport; +stats needed for "Query time" line
-        result=$(dig -4 @"$server" "$domain" +time=5 +tries=1 +stats 2>&1)
+        result=$(dig -4 @"$server" "$domain" +time=5 +tries=3 +stats 2>&1)
         ms=$(echo "$result" | grep -i "Query time" | grep -oE '[0-9]+ msec' | grep -oE '[0-9]+')
 
         if [ -n "$ms" ]; then
@@ -212,11 +391,8 @@ resolve_dns() {
             fi
             resolved=true
         else
-            # dig ran but got no Query time — log raw output for debugging
-            log "  DNS via $label ($server): dig returned no timing info"
-            log "  Raw dig output:"
-            echo "$result" | head -20 | sed 's/^/    /' | tee -a "$REPORT_FILE"
-            log "  Falling back to nslookup..."
+            # Capture error reason quietly, try nslookup next
+            dig_error=$(echo "$result" | grep -i "timed out\|no servers\|communications error" | head -1 | sed 's/^[ ;]*//')
         fi
     fi
 
@@ -225,19 +401,23 @@ resolve_dns() {
         local out
         out=$(nslookup "$domain" "$server" 2>&1)
         if echo "$out" | grep -qE "Address:.*[0-9]{1,3}\.[0-9]"; then
-            log "  DNS via $label ($server): resolved OK (via nslookup)"
-            ok "DNS from $label OK (via nslookup)"
+            log "  DNS via $label ($server): OK (via nslookup)"
+            if [ -n "$dig_error" ]; then
+                ok "DNS from $label OK — note: dig timed out (likely packet loss on UDP probe)"
+            else
+                ok "DNS from $label OK (via nslookup)"
+            fi
             resolved=true
-        else
-            log "  nslookup raw output:"
-            echo "$out" | sed 's/^/    /' | tee -a "$REPORT_FILE"
         fi
     fi
 
-    # ── Final failure ─────────────────────────────────────────
+    # ── Final failure — only now show raw output ──────────────
     if [ "$resolved" = false ]; then
         log "  DNS via $label ($server): FAILED"
         fail "DNS resolution failed via $label ($server)"
+        if [ -n "$dig_error" ]; then
+            log "  Reason: $dig_error"
+        fi
     fi
 }
 
